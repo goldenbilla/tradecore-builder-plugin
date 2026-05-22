@@ -14,10 +14,11 @@ description: |
 
 # Creating a DocType in TradeCore
 
-TradeCore is a multi-tenant, ERPNext-style platform. DocTypes are
-**code-authored as files** in an app's `doctypes/` folder and
-auto-discovered at backend startup. You almost never touch a database or
-write a migration to add one.
+TradeCore is a multi-tenant, ERPNext-style platform on a **single shared
+database** (companies separated by `company_id`). DocTypes are
+**code-authored as files** in an app's `doctypes/` folder and become
+**GLOBAL definitions** (`company_id IS NULL`, defined once) — exactly like
+Frappe. You almost never touch a database or write a migration to add one.
 
 ## Two kinds of app — pick first
 
@@ -25,12 +26,14 @@ write a migration to add one.
 | --- | --- | --- |
 | Lives in | the platform image: `backend/app/apps/<app>/` (e.g. `core`) | its **own git repo**, mounted at `EXTERNAL_APPS_DIR/<namespace>/` (default `/app/external_apps/<namespace>/`, e.g. `biomass`) |
 | `app.json` `type` | `"system"` | `"custom"` |
-| Distribution | **global** — doctypes seeded for every tenant, auto-installed everywhere | **managed** — registered in the catalog, **installed per company on demand** (no global rows, no auto-install) |
-| Doctype rows | global (`company_id IS NULL`) | company-scoped, created by the installer when a company installs the app |
+| DocType definitions | **global** (`company_id NULL`), seeded once from code | **also global** (`company_id NULL`), seeded once from code |
+| Reaching companies | auto-activated for every company | **opt-in** — an admin installs (activates) it per company |
 
-New business features should be **external custom apps** (their own repo,
-opt-in) — that's the current model. Only truly universal objects go in
-bundled `core`.
+Both kinds define their DocTypes **once, globally** (the ERPNext "define
+once" model). Install does **not** copy DocTypes per company — it just
+**activates** the app for a company. New business features should be
+**external custom apps** (their own repo, opt-in). Only truly universal
+objects go in bundled `core`.
 
 ## Mental model
 
@@ -50,10 +53,17 @@ bundled `core`.
   `@register_controller` decorator fires regardless of where the app
   lives. **No import registration, no `SYSTEM_DOCTYPES` edit, no
   `__init__.py` needed.** (A bundled app wins on a namespace collision.)
-- **How rows get created:** bundled/system doctypes are seeded global on
-  boot; external/managed doctypes are materialised into a company's tenant
-  DB by `app/custom_app/installer.py` when an admin **installs** the app
-  for that company (controller stays bound).
+- **How DocTypes get created:** ALL app DocTypes (bundled + external) are
+  seeded as **global** rows from code by
+  `platform_app_seed.py:_upsert_global_doctypes` (the same global path
+  `doctype_seed.py` uses for `core`). **Install does NOT copy them** —
+  `app/custom_app/installer.py:install_app` only records an *activation* and
+  materialises per-company resources (print formats, reports, fixtures).
+  Uninstall leaves the global DocType intact.
+- **Applying changes (the `bench migrate` equivalent):** edit the JSON →
+  `python -m app.migrate` (alembic upgrade + reconcile global defs + reload
+  registry) **or** click **Reload** in Custom Apps (no restart). Controller
+  `.py` changes need a worker restart, like Frappe's `bench restart`.
 
 ## Step 1 — Decide which app it belongs to
 
@@ -191,38 +201,33 @@ python3 -c "import json; json.load(open('<app>/doctypes/<name>/<name>.json')); p
 python3 -c "from app.doctype_engine.controller import _controller_classes; print('<Doctype Name>' in _controller_classes)"
 ```
 
-Restart the backend — startup log should show discovery + `Doctype
-registry loaded` with no tracebacks.
-
-- **Bundled/system doctype:** seeding is additive + idempotent and
-  `seed_all_tenant_doctypes()` runs against every tenant DB, so existing
-  tenants pick it up automatically.
-- **External/managed doctype:** discovery only *registers* the app; the
-  doctype rows are created when you **install** the app for a company
-  (Custom Apps → Install, or `POST /custom-apps/{id}/install`). It won't
-  appear for a company until installed.
+Then `python -m app.migrate` (or click **Reload** in Custom Apps) — the
+startup/reload log shows discovery + `Doctype registry loaded` with no
+tracebacks. The DocType becomes a **global definition immediately**, visible
+to every company. It does NOT depend on a per-company install — install only
+**activates** the app (and seeds per-company print formats/reports/fixtures).
 
 You do **not** write an Alembic migration to add a doctype or field.
 
 ## Gotchas (verified, not guesses)
 
-- **`is_submittable` is NOT read by the bundled core/system seed.**
-  `app/services/doctype_seed.py` only copies `istable`, `autoname`,
-  `title_field`, and a derived `controller_class` — it ignores
-  `is_submittable`. The **custom-app installer** (`app/custom_app/installer.py`)
-  and the **platform-app seed** *do* honor it. Since external/custom apps
-  install via that path, a submittable doctype in an external app works
-  correctly — which is another reason new submittable objects belong in a
-  custom app, not bundled `core`. Always put `is_submittable: true` in the
-  JSON regardless — it's the source of truth.
-- **Field additions are additive only.** The seeder adds new fields and
-  reconciles drifted `Select` options, but does not delete or rename
-  fields on existing tenants. Renames need a deliberate migration.
+- **Definitions are GLOBAL, reconciled from code.** `_upsert_global_doctypes`
+  (in `platform_app_seed.py`) creates/updates the single global DocType row
+  (`company_id NULL`) on every migrate/reload, honoring `is_submittable`,
+  `issingle`, `track_changes`, `autoname`, `title_field`, etc. Put the full
+  truth in the JSON — it's authoritative and reconciled on each run.
+- **Field additions are additive only.** New fields are added and drifted
+  `Select` options reconciled, but fields are not deleted/renamed
+  automatically. Renames need a deliberate migration.
 - **`Link`/`Table` `options` must match an existing doctype `name`
-  exactly** (spaces and case included), or seeding/validation breaks.
-- **Multi-tenant DB drift** is handled by `seed_all_tenant_doctypes()` at
-  startup — but if you ever seed manually, remember `alembic upgrade head`
-  only touches the control DB; each tenant DB is seeded separately.
+  exactly** (spaces and case included), or validation breaks.
+- **Layout-break fieldtypes:** the FieldType enum values have spaces
+  (`"Section Break"`, `"Column Break"`). The loader also accepts the no-space
+  member names (`"SectionBreak"`) and normalises them, but prefer the spaced
+  form in new JSON.
+- **Single shared DB.** All companies live in one database (separated by
+  `company_id`); there are no per-tenant databases to keep in sync. One
+  `alembic upgrade head` migrates everything.
 
 ## Key files (read only if you need to go deeper)
 

@@ -1,6 +1,6 @@
 {
   "name": "tradecore-builder",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Encodes how to create DocTypes, Reports, and Print Formats in TradeCore's custom-app architecture (apps under EXTERNAL_APPS_DIR, e.g. /app/external_apps/<namespace>). Lets Claude scaffold a new doctype, controller, report, or print format without re-reading the whole codebase each time.",
   "author": {
     "name": "Bilal Basra",
