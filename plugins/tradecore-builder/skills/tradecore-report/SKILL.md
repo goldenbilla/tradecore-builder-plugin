@@ -129,10 +129,12 @@ to use it, or you create a definition via the API.
 
 ### File-based report seeding (custom apps only)
 
-You can ship report definitions inside a custom app at
-`backend/app/apps/<app>/reports/<name>.json`. They are discovered by
-`app_manifest._load_reports()` and inserted into `report_definitions`
-**when the custom app is installed** (`app/custom_app/installer.py`).
+You can ship report definitions inside a custom app's `reports/<name>.json`
+folder — for an external app that's `/app/external_apps/<namespace>/reports/`
+(in the app's own repo); for bundled apps it's `backend/app/apps/<app>/reports/`.
+They are discovered by `app_manifest._load_reports()` and inserted into
+`report_definitions` **when the custom app is installed for a company**
+(`app/custom_app/installer.py`).
 
 > **Gotcha:** the installer reads `rep["doctype"]` — **not**
 > `doctype_name` — plus `report_type`, `columns`, `filters`, `group_by`,

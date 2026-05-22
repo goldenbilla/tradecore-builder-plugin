@@ -5,56 +5,85 @@ description: |
   (multi-tenant, ERPNext-style). Use whenever the user asks to add,
   change, or review a doctype, child table, controller, or document
   business logic (before_save / before_submit / GL / stock posting) in
-  the TradeCore backend. Encodes the apps/<app>/doctypes/ folder layout,
-  the JSON field schema, the controller hooks, how seeding/discovery
-  works, and the multi-tenant gotchas — so a doctype can be authored
-  without re-reading the codebase.
+  the TradeCore backend. Encodes the doctypes/ folder layout (bundled
+  core apps vs external code-backed apps), the JSON field schema, the
+  controller hooks, how dual-source discovery + per-company install work,
+  and the multi-tenant gotchas — so a doctype can be authored without
+  re-reading the codebase.
 ---
 
 # Creating a DocType in TradeCore
 
 TradeCore is a multi-tenant, ERPNext-style platform. DocTypes are
-**code-authored as files** under `backend/app/apps/<app>/doctypes/` and
-auto-discovered + seeded at backend startup. You almost never touch a
-database or write a migration to add one.
+**code-authored as files** in an app's `doctypes/` folder and
+auto-discovered at backend startup. You almost never touch a database or
+write a migration to add one.
+
+## Two kinds of app — pick first
+
+| | **Bundled (system) app** | **External (custom) app** |
+| --- | --- | --- |
+| Lives in | the platform image: `backend/app/apps/<app>/` (e.g. `core`) | its **own git repo**, mounted at `EXTERNAL_APPS_DIR/<namespace>/` (default `/app/external_apps/<namespace>/`, e.g. `biomass`) |
+| `app.json` `type` | `"system"` | `"custom"` |
+| Distribution | **global** — doctypes seeded for every tenant, auto-installed everywhere | **managed** — registered in the catalog, **installed per company on demand** (no global rows, no auto-install) |
+| Doctype rows | global (`company_id IS NULL`) | company-scoped, created by the installer when a company installs the app |
+
+New business features should be **external custom apps** (their own repo,
+opt-in) — that's the current model. Only truly universal objects go in
+bundled `core`.
 
 ## Mental model
 
-- **A doctype = a folder** at
-  `backend/app/apps/<app>/doctypes/<snake_name>/` containing:
+- **A doctype = a folder** at `<app>/doctypes/<snake_name>/` containing:
   - `<snake_name>.json` — field metadata (**required**)
   - `<snake_name>.py` — controller with business logic (**optional**)
   - `test_<snake_name>.py` — test stub (optional)
-- **Apps** live at `backend/app/apps/<app>/` and each has an `app.json`
-  manifest. `type: "system"` (e.g. `core`) = global doctypes shipped to
-  every tenant. `type: "custom"` (e.g. `dropshipping`) = an installable
-  platform app.
-- **Discovery is automatic.** At startup
-  `app/services/app_manifest.py:discover_apps()` walks `apps/*/app.json`,
-  loads every `doctypes/*/*.json`, and the seeders insert them into each
-  tenant DB. Controllers are auto-imported by
+- An **app folder** has `app.json` + the standard subfolders
+  `doctypes/ reports/ print_formats/ fixtures/ dashboards/`. (Print
+  formats and fixtures install too — see the `tradecore-print-format`
+  skill.)
+- **Discovery is automatic and dual-source.** At startup
+  `app/services/app_manifest.py:discover_apps()` scans **both** the
+  bundled `app/apps/` dir **and** `EXTERNAL_APPS_DIR`, tagging each app
+  `origin = bundled | external`. Controllers are file-loaded from both by
   `app/doctype_engine/controller.py:_discover_controllers()` so the
-  `@register_controller` decorator fires. **No import registration, no
-  `SYSTEM_DOCTYPES` edit, no `__init__.py` needed.**
+  `@register_controller` decorator fires regardless of where the app
+  lives. **No import registration, no `SYSTEM_DOCTYPES` edit, no
+  `__init__.py` needed.** (A bundled app wins on a namespace collision.)
+- **How rows get created:** bundled/system doctypes are seeded global on
+  boot; external/managed doctypes are materialised into a company's tenant
+  DB by `app/custom_app/installer.py` when an admin **installs** the app
+  for that company (controller stays bound).
 
 ## Step 1 — Decide which app it belongs to
 
-- A core/global business object (always present for all tenants) → put it
-  in `core`: `backend/app/apps/core/doctypes/<snake_name>/`.
-- A feature that tenants install/uninstall → put it in (or create) a
-  custom app: `backend/app/apps/<namespace>/doctypes/<snake_name>/`.
+- A truly universal, always-present object → bundled `core`:
+  `backend/app/apps/core/doctypes/<snake_name>/`.
+- A feature companies opt into (the common case) → an **external custom
+  app**: a folder `doctypes/<snake_name>/` inside that app's own repo,
+  which is mounted at `/app/external_apps/<namespace>/`.
 
-To create a new custom app first:
+**Creating a new external custom app** = a new git repo whose **root is
+the app folder**: `app.json` + the standard subfolders. Minimal `app.json`:
 
-```bash
-cd backend
-python -m app.scripts.new_app <namespace> --name "My App" \
-  --author "TradeCore Platform" --description "..." --version 1.0.0
+```json
+{
+  "type": "custom",
+  "namespace": "myapp",
+  "name": "My App",
+  "version": "1.0.0",
+  "author": "TradeCore Platform",
+  "status": "published",
+  "description": "…"
+}
 ```
 
-This scaffolds `apps/<namespace>/` with `app.json` + the standard
-`doctypes/ reports/ print_formats/ dashboards/ fixtures/` folders
-(`app/services/app_scaffold.py:scaffold_app`).
+Then create `doctypes/ reports/ print_formats/ fixtures/` alongside it
+(use the `biomass` repo as the reference layout). Deploy = clone the repo
+on the host and mount it at `/app/external_apps/<namespace>` (`:ro`) on
+the backend **and** celery_worker; restart → it registers as `managed`.
+The legacy in-monorepo scaffolder (`app/services/app_scaffold.py`) still
+exists for bundled apps, but new custom apps live in their own repo.
 
 ## Step 2 — Write `<snake_name>.json`
 
@@ -156,30 +185,36 @@ yielding `(db, company)` for reads against the active company DB.
 ## Step 4 — Verify
 
 ```bash
-# JSON is valid + parseable
-cd backend && python3 -c "import json; json.load(open('app/apps/<app>/doctypes/<name>/<name>.json')); print('ok')"
-# Controller imports + registers
+# JSON is valid + parseable (path is the app folder, bundled or external)
+python3 -c "import json; json.load(open('<app>/doctypes/<name>/<name>.json')); print('ok')"
+# Controller registers (run inside the backend; the app must be discoverable)
 python3 -c "from app.doctype_engine.controller import _controller_classes; print('<Doctype Name>' in _controller_classes)"
 ```
 
-Restart the backend — startup log should show the new doctype seeded and
-`Doctype registry loaded` with no tracebacks. Seeding is **additive and
-idempotent**: new doctypes are inserted, missing fields are added to
-existing doctypes, and `seed_all_tenant_doctypes()` runs the same seed
-against every tenant DB so existing tenants pick it up automatically. You
-do **not** write an Alembic migration to add a doctype or field.
+Restart the backend — startup log should show discovery + `Doctype
+registry loaded` with no tracebacks.
+
+- **Bundled/system doctype:** seeding is additive + idempotent and
+  `seed_all_tenant_doctypes()` runs against every tenant DB, so existing
+  tenants pick it up automatically.
+- **External/managed doctype:** discovery only *registers* the app; the
+  doctype rows are created when you **install** the app for a company
+  (Custom Apps → Install, or `POST /custom-apps/{id}/install`). It won't
+  appear for a company until installed.
+
+You do **not** write an Alembic migration to add a doctype or field.
 
 ## Gotchas (verified, not guesses)
 
-- **`is_submittable` is NOT read by the core/system seed.**
+- **`is_submittable` is NOT read by the bundled core/system seed.**
   `app/services/doctype_seed.py` only copies `istable`, `autoname`,
-  `title_field`, and a derived `controller_class` into the DB — it
-  ignores `is_submittable`. The **custom-app installer** and the
-  **platform-app seed** *do* honor `is_submittable`. So if you need a
-  submittable doctype, prefer authoring it in a custom/platform app, or
-  be aware the system-seed path needs extending to carry the flag. Always
-  put `is_submittable: true` in the JSON regardless — it's the source of
-  truth and other paths read it.
+  `title_field`, and a derived `controller_class` — it ignores
+  `is_submittable`. The **custom-app installer** (`app/custom_app/installer.py`)
+  and the **platform-app seed** *do* honor it. Since external/custom apps
+  install via that path, a submittable doctype in an external app works
+  correctly — which is another reason new submittable objects belong in a
+  custom app, not bundled `core`. Always put `is_submittable: true` in the
+  JSON regardless — it's the source of truth.
 - **Field additions are additive only.** The seeder adds new fields and
   reconciles drifted `Select` options, but does not delete or rename
   fields on existing tenants. Renames need a deliberate migration.
@@ -193,10 +228,11 @@ do **not** write an Alembic migration to add a doctype or field.
 
 | File | Role |
 | --- | --- |
-| `backend/app/services/app_manifest.py` | `discover_apps()`, `_load_doctypes()`, `_load_reports()` |
-| `backend/app/services/doctype_seed.py` | `seed_system_doctypes()`, `seed_all_tenant_doctypes()` |
-| `backend/app/services/platform_app_seed.py` | seeds custom/platform-app doctypes (honors `is_submittable`) |
-| `backend/app/doctype_engine/controller.py` | `BaseController`, `register_controller`, `_discover_controllers` |
+| `backend/app/config.py` | `external_apps_dir` setting (default `/app/external_apps`) |
+| `backend/app/services/app_manifest.py` | dual-source `discover_apps()` (bundled + external), `_load_doctypes/reports/print_formats/fixtures`, `AppSpec.origin` |
+| `backend/app/services/doctype_seed.py` | `seed_system_doctypes()`, `seed_all_tenant_doctypes()` (bundled/global) |
+| `backend/app/services/platform_app_seed.py` | registers apps in the catalog; `distribution` = `global` (bundled) vs `managed` (external) |
+| `backend/app/doctype_engine/controller.py` | `BaseController`, `register_controller`, `_discover_controllers` (loads from both roots) |
 | `backend/app/models/doctype.py` | `Doctype`, `DoctypeField`, `FieldType` enum |
-| `backend/app/services/app_scaffold.py` | `scaffold_app()` |
-| `backend/app/custom_app/installer.py` | installs custom apps (reads `is_submittable`, reports) |
+| `backend/app/custom_app/installer.py` | materialises a managed app into one company's tenant DB (doctypes/fields/reports/print_formats/fixtures; honors `is_submittable`) |
+| `backend/app/models/custom_app.py` | `CustomApp` (incl. `distribution`), versions, installs |
